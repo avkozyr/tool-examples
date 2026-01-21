@@ -63,6 +63,7 @@ export default class Migration {
   updatedStories: ISbStoryData[];
   stringifiedStoriesList: string;
   assetsList: SbAsset[];
+  targetAssetsList: SbAsset[];
   unusedAssetsList: SbAsset[];
   foldersToCreate: SbFolder[];
   assets: Asset[];
@@ -90,13 +91,14 @@ export default class Migration {
     this.updatedStories = [];
     this.stringifiedStoriesList = "";
     this.assetsList = [];
+    this.targetAssetsList = [];
     this.unusedAssetsList = [];
     this.foldersToCreate = [];
     this.assets = [];
     this.sourceSpaceId = sourceSpaceId;
     this.targetSpaceId = targetSpaceId;
     this.oauth = oauth;
-    this.simultaneousUploads = simultaneousUploads || 20;
+    this.simultaneousUploads = simultaneousUploads || 5;
     this.sourceRegion = (sourceRegion || "eu").toLowerCase();
     this.targetRegion = (targetRegion || "eu").toLowerCase();
     this.sourceAssetsFolders = [];
@@ -115,6 +117,7 @@ export default class Migration {
     this.mapiClient = new StoryblokClient({
       oauthToken: this.oauth,
       region: this.sourceRegion,
+      rateLimit: 3,
     });
     this.targetMapiClient =
       this.sourceRegion === this.targetRegion
@@ -122,8 +125,9 @@ export default class Migration {
         : new StoryblokClient({
             oauthToken: this.oauth,
             region: this.targetRegion,
+            rateLimit: 3,
           });
-    this.stepsTotal = this.clearSource ? 8 : 7;
+    this.stepsTotal = this.clearSource ? 9 : 8;
   }
 
   /**
@@ -131,6 +135,74 @@ export default class Migration {
    */
   migrationError(err: string) {
     throw new Error(err);
+  }
+
+  /**
+   * Check if an error is a rate limit (429) error
+   */
+  isRateLimitError(err: any): boolean {
+    return (
+      err?.status === 429 ||
+      err?.response?.status === 429 ||
+      err?.code === "ECONNABORTED" ||
+      (err?.message && err.message.includes("429"))
+    );
+  }
+
+  /**
+   * Execute requests in batches with delay between batches and retry on 429
+   */
+  async batchRequests<T>(
+    requests: (() => Promise<T>)[],
+    batchSize: number = 3,
+    delayMs: number = 350
+  ): Promise<(T | null)[]> {
+    const results: (T | null)[] = new Array(requests.length).fill(null);
+    const maxRetries = 3;
+
+    for (let i = 0; i < requests.length; i += batchSize) {
+      const batch = requests.slice(i, i + batchSize);
+      const batchIndices = batch.map((_, idx) => i + idx);
+
+      const batchResults = await Promise.allSettled(batch.map((fn) => fn()));
+
+      // Process results and collect failed indices for retry
+      const toRetry: { index: number; request: () => Promise<T> }[] = [];
+
+      batchResults.forEach((result, idx) => {
+        const originalIndex = batchIndices[idx];
+        if (result.status === "fulfilled") {
+          results[originalIndex] = result.value;
+        } else if (this.isRateLimitError(result.reason)) {
+          toRetry.push({ index: originalIndex, request: requests[originalIndex] });
+        } else {
+          console.warn(`Request ${originalIndex} failed:`, result.reason?.message || result.reason);
+          results[originalIndex] = null;
+        }
+      });
+
+      // Retry failed 429 requests with exponential backoff
+      for (const { index, request } of toRetry) {
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+          const waitTime = 1000 * Math.pow(2, attempt); // 2s, 4s, 8s
+          await new Promise((r) => setTimeout(r, waitTime));
+          try {
+            results[index] = await request();
+            break;
+          } catch (retryErr: any) {
+            if (attempt === maxRetries) {
+              console.warn(`Request ${index} failed after ${maxRetries} retries`);
+              results[index] = null;
+            }
+          }
+        }
+      }
+
+      if (i + batchSize < requests.length) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+    return results;
   }
 
   /**
@@ -168,11 +240,11 @@ export default class Migration {
       await this.getStories();
       await this.getAssetsFolders();
       await this.getAssets();
+      await this.getTargetAssets();
       await this.createAssetsFolders();
       await this.uploadAssets();
       this.replaceAssetsInStories();
       await this.saveStories();
-      if (this.clearSource) await this.deleteAssetsInSource();
     } catch (err: any) {
       console.log(
         `${chalk.white.bgRed(` ⚠ Migration Error `)} ${chalk.red(
@@ -215,15 +287,26 @@ export default class Migration {
           version: "draft",
           per_page: 25,
         });
-        const storiesResponsesManagement = await Promise.all(
-          links.map((link) =>
+        const storyRequests = links.map(
+          (link) => () =>
             this.targetMapiClient.get(
               `spaces/${this.targetSpaceId}/stories/${link.id}`
             )
-          )
         );
-        this.storiesList = storiesResponsesManagement.map((r) => r.data.story);
+        const storiesResponsesManagement = await this.batchRequests(
+          storyRequests,
+          3,
+          350
+        );
+        // Filter out failed requests (null values)
+        this.storiesList = storiesResponsesManagement
+          .filter((r): r is NonNullable<typeof r> => r !== null)
+          .map((r) => r.data.story);
         this.stringifiedStoriesList = JSON.stringify(this.storiesList);
+        const skipped = storyRequests.length - this.storiesList.length;
+        if (skipped > 0) {
+          console.log(`\nWarning: ${skipped} stories failed to fetch`);
+        }
         this.stepMessageEnd("1", `Stories fetched from target space.`);
       } else {
         this.migrationError("The CDN API client is not initialized");
@@ -310,18 +393,18 @@ export default class Migration {
     let retrievedAssets = [];
     try {
       if (this.importAssetsByIds.length) {
-        const assetsRequests = [] as Promise<ISbResult>[];
-        for (let i = 0; i < this.importAssetsByIds.length; i++) {
-          const assetId = this.importAssetsByIds[i];
-          console.log(assetId)
-          assetsRequests.push(
+        const assetsRequests = this.importAssetsByIds.map(
+          (assetId) => () =>
             this.mapiClient.get(
               `spaces/${this.sourceSpaceId}/assets/${assetId}`
             )
-          );
-        }
-        const assetsResponses = await Promise.all(assetsRequests);
-        retrievedAssets = assetsResponses.map((r) => r.data).flat();
+        );
+        const assetsResponses = await this.batchRequests(assetsRequests, 3, 350);
+        // Filter out failed requests (null values)
+        retrievedAssets = assetsResponses
+          .filter((r): r is NonNullable<typeof r> => r !== null)
+          .map((r) => r.data)
+          .flat();
       } else {
         const assetsPageRequest = await this.mapiClient.get(
           `spaces/${this.sourceSpaceId}/assets`,
@@ -338,17 +421,20 @@ export default class Migration {
           this.limit > 0
             ? endPageLimit
             : Math.ceil(assetsPageRequestTotal / 100);
-        const assetsRequests = [] as Promise<ISbResult>[];
+        const assetsRequests: (() => Promise<ISbResult>)[] = [];
         for (let i = firstPageIndex; i <= lastPageIndex; i++) {
-          assetsRequests.push(
+          const page = i;
+          assetsRequests.push(() =>
             this.mapiClient.get(`spaces/${this.sourceSpaceId}/assets`, {
               per_page: 100,
-              page: i,
+              page,
             })
           );
         }
-        const assetsResponses = await Promise.all(assetsRequests);
+        const assetsResponses = await this.batchRequests(assetsRequests, 3, 350);
+        // Filter out failed requests (null values)
         const assetsResponsesData = assetsResponses
+          .filter((r): r is NonNullable<typeof r> => r !== null)
           .map((r) => r.data.assets)
           .flat();
         // Slicing the array in case VITE_OFFSET and VITE_LIMIT are set
@@ -379,6 +465,48 @@ export default class Migration {
       this.migrationError(
         "Error fetching the assets. Please double check the source space id."
       );
+    }
+  }
+
+  /**
+   * Get existing assets from target space for deduplication
+   */
+  async getTargetAssets() {
+    this.stepMessage("4", `Fetching existing assets from target space.`);
+    try {
+      const assetsPageRequest = await this.targetMapiClient.get(
+        `spaces/${this.targetSpaceId}/assets`,
+        { per_page: 100, page: 1 }
+      );
+      const assetsTotal = assetsPageRequest.total || 1;
+      const totalPages = Math.ceil(assetsTotal / 100);
+
+      const assetsRequests: (() => Promise<ISbResult>)[] = [];
+      for (let i = 1; i <= totalPages; i++) {
+        const page = i;
+        assetsRequests.push(() =>
+          this.targetMapiClient.get(`spaces/${this.targetSpaceId}/assets`, {
+            per_page: 100,
+            page,
+          })
+        );
+      }
+
+      const assetsResponses = await this.batchRequests(assetsRequests, 3, 350);
+      this.targetAssetsList = assetsResponses
+        .filter((r): r is NonNullable<typeof r> => r !== null)
+        .map((r) => r.data.assets)
+        .flat();
+
+      this.stepMessageEnd(
+        "4",
+        `Fetched ${this.targetAssetsList.length} existing assets from target space.`
+      );
+    } catch (err) {
+      console.log(err);
+      // Non-fatal: continue with empty list (will upload all assets)
+      console.log("Warning: Could not fetch target assets for deduplication");
+      this.targetAssetsList = [];
     }
   }
 
@@ -416,7 +544,7 @@ export default class Migration {
    * Create assets folders in target space (safe with circular check)
    */
   async createAssetsFolders() {
-    this.stepMessage("4", `Creating assets folders in target space.`);
+    this.stepMessage("5", `Creating assets folders in target space.`);
     try {
       // filter folders that need creation and are not orphans
       const foldersToCreate = this.sourceAssetsFolders.filter(
@@ -463,7 +591,7 @@ export default class Migration {
           this.sourceAssetsFoldersMap[asset.asset_folder_id];
       });
 
-      this.stepMessageEnd("4", `Assets folders created in target space`);
+      this.stepMessageEnd("5", `Assets folders created in target space`);
     } catch (err) {
       console.log(err);
       this.migrationError(
@@ -490,7 +618,19 @@ export default class Migration {
    * Upload all assets to the target space with concurrency and iterative retries
    */
   async uploadAssets() {
-    this.stepMessage("5", ``, `0 of ${this.assetsList.length} assets uploaded`);
+    // Deduplication: filter out assets that already exist in target
+    const targetAssetFilenames = new Set(
+      this.targetAssetsList.map((a) => this.getAssetFilename(a.filename))
+    );
+    const assetsToUpload = this.assetsList.filter(
+      (asset) => !targetAssetFilenames.has(this.getAssetFilename(asset.filename))
+    );
+    const skippedCount = this.assetsList.length - assetsToUpload.length;
+    if (skippedCount > 0) {
+      console.log(`\nSkipping ${skippedCount} assets (already exist in target)`);
+    }
+
+    this.stepMessage("6", ``, `0 of ${assetsToUpload.length} assets to upload`);
     this.assets = [];
 
     let totalUploaded = 0;
@@ -498,7 +638,7 @@ export default class Migration {
     // async.eachLimit for concurrency
     await new Promise<void>((resolve) => {
       async.eachLimit(
-        this.assetsList,
+        assetsToUpload,
         this.simultaneousUploads,
         async (asset: SbAsset) => {
           const assetUrl = this.getAssetFilename(asset.filename);
@@ -515,11 +655,14 @@ export default class Migration {
 
           const success = await this.uploadAsset(assetUrl, assetData);
 
+          // Small delay between uploads to avoid rate limits
+          await new Promise((r) => setTimeout(r, 200));
+
           totalUploaded++;
           this.stepMessage(
-            "5",
+            "6",
             ``,
-            `${totalUploaded} of ${this.assetsList.length} assets uploaded${
+            `${totalUploaded} of ${assetsToUpload.length} assets uploaded${
               success ? "" : " (failed)"
             }`
           );
@@ -527,8 +670,8 @@ export default class Migration {
         () => {
           process.stdout.clearLine(0);
           this.stepMessageEnd(
-            "5",
-            `Uploaded ${totalUploaded} of ${this.assetsList.length} assets to target space.`
+            "6",
+            `Uploaded ${totalUploaded} of ${assetsToUpload.length} assets to target space.`
           );
           resolve();
         }
@@ -687,9 +830,7 @@ export default class Migration {
         return true;
       } catch (err: any) {
         // check if retryable error
-        const retryable =
-          err.code === "ECONNABORTED" ||
-          (err.message && err.message.includes("429"));
+        const retryable = this.isRateLimitError(err);
 
         if (!retryable || attempt === maxRetries) {
           const assetObject = this.assets.find(
@@ -757,17 +898,17 @@ export default class Migration {
    * Replace the new urls in the target space stories
    */
   replaceAssetsInStories() {
-    this.stepMessage("6", ``, `0 of ${this.assets.length} URLs replaced`);
+    this.stepMessage("7", ``, `0 of ${this.assets.length} URLs replaced`);
     this.updatedStories = this.storiesList.slice(0);
     this.assets.forEach((asset, index) => {
       this.updatedStories = this.replaceAssetInData(this.updatedStories, asset);
       this.stepMessage(
-        "6",
+        "7",
         ``,
         `${index} of ${this.assets.length} URLs replaced`
       );
     });
-    this.stepMessageEnd("6", `Replaced all URLs in the stories.`);
+    this.stepMessageEnd("7", `Replaced all URLs in the stories.`);
   }
 
   /**
@@ -796,7 +937,7 @@ export default class Migration {
             post_data
           );
           this.stepMessage(
-            "7",
+            "8",
             ``,
             `${++total} of ${storiesWithUpdates.length} stories updated.`
           );
@@ -808,7 +949,7 @@ export default class Migration {
     );
     process.stdout.clearLine(0);
     this.stepMessageEnd(
-      "7",
+      "8",
       `Updated ${
         migrationResult.filter((r) => r.status === "fulfilled" && r.value)
           .length
@@ -832,22 +973,5 @@ export default class Migration {
         4
       )
     );
-  }
-
-  /**
-   * Delete assets in source
-   */
-  async deleteAssetsInSource() {
-    this.stepMessage("8", `Deleting assets from source space.`);
-    await Promise.allSettled(
-      this.assetsList.map(
-        async (asset) =>
-          await this.mapiClient.delete(
-            `spaces/${this.sourceSpaceId}/assets/${asset.id}`,
-            {}
-          )
-      )
-    );
-    this.stepMessageEnd("8", `Deleting assets from source space.`);
   }
 }

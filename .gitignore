@@ -106,3 +106,4 @@ dist
 # Local Test
 */local-test.js
 */log.json
+.idea
